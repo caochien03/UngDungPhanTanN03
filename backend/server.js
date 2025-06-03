@@ -8,11 +8,12 @@ const fs = require("fs");
 const path = require("path");
 
 // Constants
-const HEARTBEAT_INTERVAL = 2000; // ms
-const HEARTBEAT_TIMEOUT = 2000; // ms
+const HEARTBEAT_INTERVAL = 5000; // ms
+const HEARTBEAT_TIMEOUT = 10000; // ms
 const NODE_LIST = ["node1", "node2", "node3"];
-const SNAPSHOT_REQUEST_DELAY = 5000; // ms
-const PEER_CONNECTION_DELAY = 2000; // ms
+const SNAPSHOT_REQUEST_DELAY = 10000; // ms
+const PEER_CONNECTION_DELAY = 5000; // ms
+const MAX_STORE_SIZE = 1000; // Thêm giới hạn kích thước store
 
 // Lấy node ID từ tham số dòng lệnh
 const nodeId = process.argv[2] || "node1";
@@ -31,8 +32,10 @@ const io = socketIo(server, {
         origin: "*",
         methods: ["GET", "POST"],
     },
-    pingTimeout: 60000,
-    pingInterval: 25000,
+    pingTimeout: 120000,
+    pingInterval: 50000,
+    connectTimeout: 30000,
+    transports: ["websocket", "polling"],
 });
 
 // State management
@@ -46,7 +49,19 @@ const storeFile = path.join(__dirname, `store_${nodeId}.json`);
 // Utility functions
 function saveStoreToFile() {
     try {
-        fs.writeFileSync(storeFile, JSON.stringify(store, null, 2), "utf-8");
+        // Giới hạn kích thước store trước khi lưu
+        const limitedStore = {};
+        let count = 0;
+        for (const key in store) {
+            if (count >= MAX_STORE_SIZE) break;
+            limitedStore[key] = store[key];
+            count++;
+        }
+        fs.writeFileSync(
+            storeFile,
+            JSON.stringify(limitedStore, null, 2),
+            "utf-8"
+        );
     } catch (err) {
         console.error(`[${nodeId}] Error saving store to file:`, err);
     }
@@ -181,10 +196,12 @@ function connectToPeer(peer) {
     const peerSocket = socketIoClient(`http://${peer.host}:${peer.port}`, {
         reconnection: true,
         reconnectionAttempts: Infinity,
-        reconnectionDelay: 2000,
-        reconnectionDelayMax: 10000,
-        timeout: 20000,
+        reconnectionDelay: 5000,
+        reconnectionDelayMax: 20000,
+        timeout: 30000,
         transports: ["websocket", "polling"],
+        forceNew: true,
+        multiplex: false,
     });
 
     peerConnections[peer.id] = peerSocket;
@@ -274,7 +291,14 @@ io.on("connection", (socket) => {
 
     socket.on("put", handlePut);
     socket.on("get", (key) => handleGet(key, socket));
-    socket.on("delete", handleDelete);
+    socket.on("delete", (data) => {
+        // Xử lý cả trường hợp data là string hoặc object
+        if (typeof data === "string") {
+            handleDelete(data, false);
+        } else {
+            handleDelete(data.key, data.isBroadcast);
+        }
+    });
     socket.on("replicate", handleReplicate);
     socket.on("replicateDelete", handleReplicateDelete);
     socket.on("request_snapshot", handleRequestSnapshot);
@@ -283,6 +307,12 @@ io.on("connection", (socket) => {
 
 // Request handlers
 function handlePut(data) {
+    // Kiểm tra kích thước store trước khi thêm
+    if (Object.keys(store).length >= MAX_STORE_SIZE) {
+        console.log(`[${nodeId}] Store is full, cannot add more data`);
+        return;
+    }
+
     const [primary, secondary] = getPrimaryAndSecondaryNodes(data.key);
     console.log(
         `[${nodeId}] PUT ${data.key}: primary=${primary}, secondary=${secondary}`
@@ -343,16 +373,26 @@ function handleGet(key, socket) {
     forwardGetRequest(key, primary, secondary, socket);
 }
 
-function handleDelete(key) {
+function handleDelete(key, isBroadcast = false) {
     const realKey = typeof key === "string" ? key : key.key;
+    console.log(
+        `[${nodeId}] Handling delete request for key: ${realKey} (isBroadcast: ${isBroadcast})`
+    );
 
     if (store[realKey] !== undefined) {
+        console.log(`[${nodeId}] Deleting key from local store: ${realKey}`);
         delete store[realKey];
         saveStoreToFile();
         io.emit("delete", realKey);
+        console.log(`[${nodeId}] Key deleted successfully: ${realKey}`);
+    } else {
+        console.log(`[${nodeId}] Key not found in local store: ${realKey}`);
     }
 
-    broadcastDelete(realKey);
+    // Chỉ broadcast nếu đây là request delete ban đầu, không phải từ broadcast
+    if (!isBroadcast) {
+        broadcastDelete(realKey);
+    }
 }
 
 function handleRequestSnapshot(data) {
@@ -422,12 +462,26 @@ function forwardGetRequest(key, primary, secondary, socket) {
 }
 
 function broadcastDelete(key) {
+    console.log(`[${nodeId}] Broadcasting delete for key: ${key}`);
+    let broadcastCount = 0;
+
     for (const peerId in peerConnections) {
         const peer = peerConnections[peerId];
         if (peer?.connected) {
-            peer.emit("delete", key);
+            // Gửi kèm flag isBroadcast để các node khác biết đây là broadcast
+            peer.emit("delete", { key, isBroadcast: true });
+            broadcastCount++;
+            console.log(`[${nodeId}] Delete broadcasted to peer: ${peerId}`);
+        } else {
+            console.log(
+                `[${nodeId}] Cannot broadcast to peer ${peerId} - not connected`
+            );
         }
     }
+
+    console.log(
+        `[${nodeId}] Delete broadcast completed. Sent to ${broadcastCount} peers`
+    );
 }
 
 // Initialize
@@ -460,8 +514,20 @@ server.listen(PORT, () => {
 // Error handling
 process.on("uncaughtException", (err) => {
     console.error(`[${nodeId}] Uncaught Exception:`, err);
+    // Cleanup before exit
+    for (const peerId in peerConnections) {
+        if (peerConnections[peerId]) {
+            peerConnections[peerId].disconnect();
+        }
+    }
+    process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
     console.error(`[${nodeId}] Unhandled Rejection:`, reason);
 });
+
+// Memory leak prevention
+setInterval(() => {
+    global.gc && global.gc();
+}, 30000);
