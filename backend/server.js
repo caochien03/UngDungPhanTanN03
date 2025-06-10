@@ -11,7 +11,7 @@ const path = require("path");
 const HEARTBEAT_INTERVAL = 5000; // ms
 const HEARTBEAT_TIMEOUT = 10000; // ms
 const NODE_LIST = ["node1", "node2", "node3"];
-const SNAPSHOT_REQUEST_DELAY = 10000; // ms
+const DATA_SYNC_DELAY = 10000; // ms
 const PEER_CONNECTION_DELAY = 5000; // ms
 const MAX_STORE_SIZE = 1000; // Thêm giới hạn kích thước store
 
@@ -43,7 +43,7 @@ const store = {};
 const peerConnections = {};
 const lastHeartbeat = {};
 const failedPeers = new Set();
-const pendingSnapshotPeers = new Set();
+const pendingDataPeers = new Set();
 const storeFile = path.join(__dirname, `store_${nodeId}.json`);
 
 // Utility functions
@@ -140,12 +140,12 @@ function checkHeartbeatTimeout() {
     }, 1000);
 }
 
-// Snapshot management
-function handleSnapshot(data, socket) {
+// Data sync management
+function syncNodeData(data, socket) {
     if (!data || data.to !== nodeId || !data.data) return;
 
     const peerInfo = socket?.handshake?.address || socket?.id || "peerSocket";
-    console.log(`[${nodeId}] Received snapshot from ${peerInfo}`);
+    console.log(`[${nodeId}] Received data sync from ${peerInfo}`);
 
     let updatedKeys = 0;
     let removedKeys = 0;
@@ -159,7 +159,7 @@ function handleSnapshot(data, socket) {
         }
     }
 
-    // Update values from snapshot for keys this node is responsible for
+    // Update values from sync data for keys this node is responsible for
     for (const key in data.data) {
         const [primary, secondary] = getPrimaryAndSecondaryNodes(key);
         if (nodeId === primary || nodeId === secondary) {
@@ -171,21 +171,40 @@ function handleSnapshot(data, socket) {
     saveStoreToFile();
     io.emit("store", store);
     console.log(
-        `[${nodeId}] Snapshot processed: ${updatedKeys} updated, ${removedKeys} removed`
+        `[${nodeId}] Data sync completed: ${updatedKeys} updated, ${removedKeys} removed`
     );
 }
 
-function tryRequestSnapshot(peerId) {
+function requestNodeData(peerId) {
     const peer = peerConnections[peerId];
     if (peer?.connected) {
-        console.log(`[${nodeId}] Requesting snapshot from peer: ${peerId}`);
-        peer.emit("request_snapshot", { requester: nodeId });
-        pendingSnapshotPeers.delete(peerId);
+        console.log(`[${nodeId}] Requesting data from peer: ${peerId}`);
+        peer.emit("request_data", { requester: nodeId });
+        pendingDataPeers.delete(peerId);
     } else {
         console.log(
-            `[${nodeId}] Peer ${peerId} not connected, adding to pending snapshot requests`
+            `[${nodeId}] Peer ${peerId} not connected, adding to pending data requests`
         );
-        pendingSnapshotPeers.add(peerId);
+        pendingDataPeers.add(peerId);
+    }
+}
+
+function handleDataRequest(data) {
+    if (!data?.requester) return;
+
+    console.log(`[${nodeId}] Received data request from ${data.requester}`);
+    const peer = peerConnections[data.requester];
+    const nodeData = { ...store };
+
+    if (peer?.connected) {
+        peer.emit("sync_data", {
+            to: data.requester,
+            from: nodeId,
+            data: nodeData,
+            timestamp: data.timestamp,
+        });
+    } else {
+        pendingDataPeers.add(data.requester);
     }
 }
 
@@ -227,23 +246,23 @@ function setupPeerEventHandlers(peerSocket, peerId) {
 
     peerSocket.on("replicate", handleReplicate);
     peerSocket.on("replicateDelete", handleReplicateDelete);
-    peerSocket.on("snapshot", (data) => handleSnapshot(data, peerSocket));
+    peerSocket.on("sync_data", (data) => syncNodeData(data, peerSocket));
 }
 
 // Event handlers
 function handlePeerConnection(peerId) {
-    if (pendingSnapshotPeers.has(peerId)) {
-        const snapshot = { ...store };
+    if (pendingDataPeers.has(peerId)) {
+        const nodeData = { ...store };
         const peer = peerConnections[peerId];
 
         if (peer && peer.connected) {
-            peer.emit("snapshot", {
+            peer.emit("sync_data", {
                 to: peerId,
                 from: nodeId,
-                data: snapshot,
+                data: nodeData,
                 timestamp: Date.now(),
             });
-            pendingSnapshotPeers.delete(peerId);
+            pendingDataPeers.delete(peerId);
         }
     }
 }
@@ -301,8 +320,8 @@ io.on("connection", (socket) => {
     });
     socket.on("replicate", handleReplicate);
     socket.on("replicateDelete", handleReplicateDelete);
-    socket.on("request_snapshot", handleRequestSnapshot);
-    socket.on("snapshot", (data) => handleSnapshot(data, socket));
+    socket.on("request_data", handleDataRequest);
+    socket.on("sync_data", (data) => syncNodeData(data, socket));
 });
 
 // Request handlers
@@ -395,25 +414,6 @@ function handleDelete(key, isBroadcast = false) {
     }
 }
 
-function handleRequestSnapshot(data) {
-    if (!data?.requester) return;
-
-    console.log(`[${nodeId}] Received snapshot request from ${data.requester}`);
-    const peer = peerConnections[data.requester];
-    const snapshot = { ...store };
-
-    if (peer?.connected) {
-        peer.emit("snapshot", {
-            to: data.requester,
-            from: nodeId,
-            data: snapshot,
-            timestamp: data.timestamp,
-        });
-    } else {
-        pendingSnapshotPeers.add(data.requester);
-    }
-}
-
 // Helper functions
 function forwardToPrimary(primary, event, data) {
     if (peerConnections[primary]) {
@@ -502,13 +502,13 @@ server.listen(PORT, () => {
     startHeartbeat();
     checkHeartbeatTimeout();
 
-    // Request snapshot from peers after a delay
+    // Request data from peers after a delay
     setTimeout(() => {
-        console.log(`[${nodeId}] Requesting snapshot from peers...`);
+        console.log(`[${nodeId}] Requesting data from peers...`);
         for (const peerId in peerConnections) {
-            tryRequestSnapshot(peerId);
+            requestNodeData(peerId);
         }
-    }, SNAPSHOT_REQUEST_DELAY);
+    }, DATA_SYNC_DELAY);
 });
 
 // Error handling
